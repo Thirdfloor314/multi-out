@@ -1,0 +1,19 @@
+[Unit]
+Description=Multi-Out Bluetooth auto-switch
+Documentation=file:%h/bin/multiout
+After=pipewire.service wireplumber.service
+Wants=pipewire.service
+# It reconnects on its own if PipeWire restarts, so a crash loop is the only
+# real failure mode worth guarding against.
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+[Service]
+Type=simple
+ExecStart=%h/bin/multiout --daemon
+Restart=always
+RestartSec=3
+Slice=session.slice
+
+[Install]
+WantedBy=default.target

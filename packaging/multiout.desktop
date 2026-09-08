@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Multi-Out
+GenericName=Audio Output Router
+Comment=Play audio on several outputs at once — Bluetooth, wired and HDMI together
+Exec=multiout %F
+Icon=audio-headphones
+Terminal=false
+Categories=AudioVideo;Audio;
+Keywords=bluetooth;audio;output;sink;headphones;speakers;combine;
+StartupNotify=true

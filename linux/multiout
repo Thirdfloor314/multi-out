@@ -1,0 +1,1059 @@
+#!/usr/bin/env python3
+"""
+Multi-Out — route audio to several outputs at once (Bluetooth, wired, HDMI).
+
+Builds a PipeWire combine sink over whichever outputs you tick. Switching the
+selection never disconnects a Bluetooth device and never stops playback: the
+new sink is built and linked first, live streams are moved onto it, and only
+then is the old one torn down.
+
+Run with --daemon for the headless auto-switch service: it watches PipeWire and
+points audio at a Bluetooth device the moment one connects, so you never have to
+open this window to pick it.
+"""
+from __future__ import annotations
+
+import fcntl
+import glob
+import json
+import os
+import re
+import select
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from dataclasses import dataclass, field
+
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+from PyQt6.QtGui import QFont, QIcon
+from PyQt6.QtWidgets import (
+    QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QMainWindow,
+    QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSlider, QVBoxLayout,
+    QWidget,
+)
+
+RUNTIME = os.environ.get("XDG_RUNTIME_DIR", f"/run/user/{os.getuid()}")
+STATE = os.path.expanduser("~/.local/share/multiout/state.json")
+SERVICE = "multiout-autoswitch.service"
+
+# Quiet period after a topology event before we act, so a device that registers
+# its card, sink and ports in quick succession is handled once, not three times.
+DEBOUNCE = 0.8
+
+
+# ---------------------------------------------------------------- state file
+
+def load_state() -> dict:
+    try:
+        with open(STATE) as fh:
+            d = json.load(fh)
+        if isinstance(d, dict):
+            return d
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_state(**changes) -> None:
+    """Merge keys into the state file. The GUI and the daemon both write here,
+    so this must never rewrite the whole document from one side's view."""
+    d = load_state()
+    d.update(changes)
+    try:
+        os.makedirs(os.path.dirname(STATE), exist_ok=True)
+        tmp = f"{STATE}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(d, fh)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def daemon_running() -> bool:
+    """True when the systemd auto-switch service owns the switching."""
+    try:
+        return subprocess.run(
+            ["systemctl", "--user", "is-active", "--quiet", SERVICE],
+            capture_output=True, timeout=3).returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+# ---------------------------------------------------------------- shell helpers
+
+def run(cmd: list[str], timeout: float = 5.0) -> str:
+    """Run a command, return stdout, empty string on any failure."""
+    try:
+        p = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        return p.stdout if p.returncode == 0 else ""
+    except (subprocess.SubprocessError, OSError):
+        return ""
+
+
+def run_json(cmd: list[str], timeout: float = 5.0):
+    out = run(cmd, timeout)
+    if not out.strip():
+        return []
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return []
+
+
+# ---------------------------------------------------------------- data model
+
+@dataclass
+class Sink:
+    index: int
+    name: str
+    description: str
+    kind: str           # bluetooth | wired | hdmi | virtual
+    volume: int         # 0-150 percent
+    muted: bool
+    mac: str = ""
+    battery: int | None = None
+
+    @property
+    def is_ours(self) -> bool:
+        return self.name.startswith("multiout_")
+
+
+@dataclass
+class BtDevice:
+    mac: str
+    name: str
+    connected: bool
+    battery: int | None = None
+
+
+@dataclass
+class Inventory:
+    sinks: list[Sink] = field(default_factory=list)
+    bt_offline: list[BtDevice] = field(default_factory=list)
+    default_sink: str = ""
+
+
+def classify(name: str) -> str:
+    if name.startswith("bluez_output"):
+        return "bluetooth"
+    if name.startswith("multiout_"):
+        return "virtual"
+    low = name.lower()
+    if "hdmi" in low or "displayport" in low:
+        return "hdmi"
+    if name.startswith("alsa_output"):
+        return "wired"
+    return "virtual"
+
+
+def bt_info(mac: str) -> tuple[str, bool, int | None]:
+    """Return (name, connected, battery%) for a paired Bluetooth device."""
+    txt = run(["bluetoothctl", "info", mac])
+    name, connected, battery = mac, False, None
+    for line in txt.splitlines():
+        line = line.strip()
+        if line.startswith("Alias:"):
+            name = line.split(":", 1)[1].strip()
+        elif line.startswith("Connected:"):
+            connected = line.split(":", 1)[1].strip() == "yes"
+        elif line.startswith("Battery Percentage:"):
+            # e.g. "Battery Percentage: 0x50 (80)"
+            if "(" in line and ")" in line:
+                try:
+                    battery = int(line.rsplit("(", 1)[1].rstrip(")"))
+                except ValueError:
+                    pass
+    return name, connected, battery
+
+
+def scan() -> Inventory:
+    inv = Inventory()
+    inv.default_sink = run(["pactl", "get-default-sink"]).strip()
+
+    # Paired Bluetooth devices, so we can show ones that aren't connected yet.
+    paired: dict[str, BtDevice] = {}
+    for line in run(["bluetoothctl", "devices", "Paired"]).splitlines():
+        parts = line.split(maxsplit=2)
+        if len(parts) >= 2 and parts[0] == "Device":
+            mac = parts[1]
+            nm, conn, batt = bt_info(mac)
+            paired[mac.replace(":", "_")] = BtDevice(mac, nm, conn, batt)
+
+    for s in run_json(["pactl", "-f", "json", "list", "sinks"]):
+        try:
+            name = s["name"]
+            vol = s.get("volume", {})
+            first = next(iter(vol.values())) if vol else {}
+            pct = int(str(first.get("value_percent", "100%")).rstrip("%"))
+            sink = Sink(
+                index=int(s["index"]),
+                name=name,
+                description=s.get("description") or name,
+                kind=classify(name),
+                volume=pct,
+                muted=bool(s.get("mute", False)),
+            )
+        except (KeyError, StopIteration, ValueError, TypeError):
+            continue
+
+        if sink.kind == "bluetooth":
+            key = sink.name.removeprefix("bluez_output.").rsplit(".", 1)[0]
+            dev = paired.get(key)
+            if dev:
+                sink.mac = dev.mac
+                sink.battery = dev.battery
+                paired.pop(key, None)
+        inv.sinks.append(sink)
+
+    # Audio-capable paired devices with no sink = connectable but offline.
+    for key, dev in paired.items():
+        cls = run(["bluetoothctl", "info", dev.mac])
+        if "Audio Sink" in cls:
+            inv.bt_offline.append(dev)
+
+    order = {"bluetooth": 0, "wired": 1, "hdmi": 2, "virtual": 3}
+    inv.sinks.sort(key=lambda s: (order.get(s.kind, 9), s.description.lower()))
+    return inv
+
+
+# ---------------------------------------------------------------- combine sink
+
+class CombineManager:
+    """Owns the standalone PipeWire process hosting our combine-stream module."""
+
+    def __init__(self) -> None:
+        self.pid: int | None = None
+        self.node: str = ""
+        self.counter = 0
+
+    # -- adoption -----------------------------------------------------------
+    @staticmethod
+    def find_running() -> list[tuple[str, int]]:
+        """Existing (node, pid) combine hosts, from a previous run of this app."""
+        found = []
+        out = run(["pgrep", "-af", "pipewire -c .*/multiout-.*\\.conf"])
+        for line in out.splitlines():
+            pid_s, _, cmd = line.partition(" ")
+            m = re.search(r"multiout-(multiout_[0-9]+_[0-9]+)\.conf", cmd)
+            if m and pid_s.isdigit():
+                found.append((m.group(1), int(pid_s)))
+        return found
+
+    def adopt(self) -> None:
+        """Take ownership of a still-running combine sink instead of rebuilding
+        it, so reopening the app never interrupts audio. Extras are reaped."""
+        live = {s.get("name") for s in run_json(
+            ["pactl", "-f", "json", "list", "sinks"])}
+        hosts = [(n, pid) for n, pid in self.find_running() if n in live]
+        for node, pid in hosts[1:]:
+            self._kill_pid(pid)
+        for node, pid in self.find_running():
+            if node not in live:
+                self._kill_pid(pid)     # process alive but sink gone: stale
+        if hosts:
+            self.node, self.pid = hosts[0]
+
+    @staticmethod
+    def _reap_files() -> None:
+        """Delete conf/log files left by combine hosts that are no longer
+        running. The daemon rebuilds far more often than the window did, so
+        these would otherwise pile up in the runtime dir all session."""
+        live = {n for n, _ in CombineManager.find_running()}
+        for path in (glob.glob(f"{RUNTIME}/multiout-*.conf")
+                     + glob.glob(f"{RUNTIME}/multiout-*.log")):
+            m = re.search(r"multiout-(multiout_\d+_\d+)\.(?:conf|log)$", path)
+            if m and m.group(1) not in live:
+                try:
+                    os.remove(path)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _kill_pid(pid: int) -> None:
+        try:
+            os.killpg(os.getpgid(pid), signal.SIGTERM)
+        except (ProcessLookupError, PermissionError, OSError):
+            try:
+                os.kill(pid, signal.SIGTERM)
+            except OSError:
+                pass
+
+    # -- config -------------------------------------------------------------
+    def _write_conf(self, node: str, targets: list[str], compensate: bool) -> str:
+        match = " ".join(
+            '{ media.class = Audio/Sink node.name = "%s" }' % t for t in targets
+        )
+        conf = f"""
+# Standalone module host: connects to the running PipeWire daemon as a client,
+# so it loads the same base modules client.conf does before combine-stream.
+context.properties = {{ log.level = 2 }}
+context.spa-libs = {{
+  audio.convert.* = audioconvert/libspa-audioconvert
+  support.*       = support/libspa-support
+}}
+context.modules = [
+  {{ name = libpipewire-module-rt              flags = [ ifexists nofail ] }}
+  {{ name = libpipewire-module-protocol-native }}
+  {{ name = libpipewire-module-client-node     }}
+  {{ name = libpipewire-module-adapter         }}
+  {{ name = libpipewire-module-metadata        }}
+  {{ name = libpipewire-module-combine-stream
+    args = {{
+      combine.mode = sink
+      node.name    = "{node}"
+      node.description = "Multi-Out"
+      combine.latency-compensate = {"true" if compensate else "false"}
+      combine.props = {{ audio.position = [ FL FR ] }}
+      stream.props  = {{}}
+      stream.rules = [
+        {{ matches = [ {match} ]
+          actions = {{ create-stream = {{ audio.position = [ FL FR ] }} }} }}
+      ]
+    }}
+  }}
+]
+"""
+        path = f"{RUNTIME}/multiout-{node}.conf"
+        with open(path, "w") as fh:
+            fh.write(conf)
+        return path
+
+    # -- lifecycle ----------------------------------------------------------
+    def spawn(self, targets: list[str], compensate: bool) -> str | None:
+        """Start a new combine sink. Returns its node name, or None on failure."""
+        self._reap_files()
+        self.counter += 1
+        node = f"multiout_{os.getpid()}_{self.counter}"
+        path = self._write_conf(node, targets, compensate)
+        log = open(f"{RUNTIME}/multiout-{node}.log", "w")
+        try:
+            proc = subprocess.Popen(
+                ["pipewire", "-c", path], stdout=log, stderr=subprocess.STDOUT,
+                start_new_session=True,
+            )
+        except OSError:
+            return None
+
+        # Wait for the sink to register with the daemon before using it.
+        for _ in range(40):
+            if proc.poll() is not None:
+                return None
+            names = [s.get("name") for s in run_json(
+                ["pactl", "-f", "json", "list", "sinks"])]
+            if node in names:
+                self.pid, self.node = proc.pid, node
+                return node
+            time.sleep(0.1)
+
+        proc.terminate()
+        return None
+
+    def kill(self, pid: int | None = None) -> None:
+        target = pid if pid is not None else self.pid
+        if target is not None:
+            self._kill_pid(target)
+        if pid is None or pid == self.pid:
+            self.pid, self.node = None, ""
+
+
+def move_streams(to_sink: str, from_sinks: set[str]) -> int:
+    """Move live streams sitting on from_sinks onto to_sink. Returns count."""
+    sinks = {s["index"]: s["name"] for s in
+             run_json(["pactl", "-f", "json", "list", "sinks"])
+             if "index" in s and "name" in s}
+    moved = 0
+    for si in run_json(["pactl", "-f", "json", "list", "sink-inputs"]):
+        idx, cur = si.get("index"), si.get("sink")
+        if idx is None:
+            continue
+        if sinks.get(cur) in from_sinks:
+            r = subprocess.run(["pactl", "move-sink-input", str(idx), to_sink],
+                               capture_output=True)
+            if r.returncode == 0:
+                moved += 1
+    return moved
+
+
+def conf_targets(node: str) -> list[str]:
+    """The outputs a running combine sink was built from, read back from the
+    config we wrote for it. Authoritative even across app restarts."""
+    try:
+        with open(f"{RUNTIME}/multiout-{node}.conf") as fh:
+            txt = fh.read()
+    except OSError:
+        return []
+    return [n for n in re.findall(r'node\.name\s*=\s*"([^"]+)"', txt)
+            if n != node]
+
+
+def fallback_sink(sinks: list[Sink]) -> str:
+    """Where audio should land when the outputs in use have all gone away."""
+    for kind in ("wired", "hdmi"):
+        for s in sinks:
+            if s.kind == kind:
+                return s.name
+    return ""
+
+
+def activate(combine: CombineManager, targets: list[str], old_default: str,
+             compensate: bool) -> str | None:
+    """Point audio at `targets`, building a combine sink when there's more than
+    one. Live streams move across before the previous sink is torn down, so
+    playback never gaps and no Bluetooth link is dropped.
+
+    Returns the destination sink name, or None if the combine sink failed.
+    """
+    old_pid, old_node = combine.pid, combine.node
+
+    if len(targets) == 1:
+        dest = targets[0]
+    else:
+        dest = combine.spawn(targets, compensate)
+        if dest is None:
+            return None
+
+    sources = set(targets) | ({old_default} if old_default else set())
+    if old_node:
+        sources.add(old_node)
+    move_streams(dest, sources)
+    subprocess.run(["pactl", "set-default-sink", dest], capture_output=True)
+
+    # Tear the previous host down only after audio has moved across.
+    if old_pid is not None and old_pid != combine.pid:
+        combine.kill(old_pid)
+    if len(targets) == 1 and old_pid is not None and old_pid == combine.pid:
+        combine.kill()
+
+    save_state(selected=sorted(targets))
+    return dest
+
+
+# ---------------------------------------------------------------- auto-switch
+
+class AutoSwitch:
+    """Follows Bluetooth sinks appearing and disappearing.
+
+    Edge-triggered on purpose: it acts on a device *arriving* or *leaving*, not
+    on it merely being present, so it never fights a choice made by hand.
+    """
+
+    def __init__(self, combine: CombineManager) -> None:
+        self.combine = combine
+        self.known: set[str] = set()
+        self.primed = False
+
+    @staticmethod
+    def _bt(inv: Inventory) -> set[str]:
+        return {s.name for s in inv.sinks if s.kind == "bluetooth"}
+
+    def prime(self, inv: Inventory) -> None:
+        """Record what is connected without reacting to it."""
+        self.known = self._bt(inv)
+        self.primed = True
+
+    def reconcile(self, inv: Inventory, compensate: bool) -> str:
+        """Act on any change since the last look. Returns a status line, or ""
+        when there was nothing to do."""
+        current = self._bt(inv)
+        if not self.primed:
+            self.prime(inv)
+            return ""
+        arrived = sorted(current - self.known)
+        departed = self.known - current
+        self.known = current
+
+        if arrived:
+            return self._on_connect(arrived, inv, compensate)
+        if departed:
+            return self._on_disconnect(departed, inv, compensate)
+        return ""
+
+    # -- transitions --------------------------------------------------------
+    def _live(self, inv: Inventory) -> set[str]:
+        return {s.name for s in inv.sinks if s.kind != "virtual"}
+
+    def _on_connect(self, arrived: list[str], inv: Inventory,
+                    compensate: bool) -> str:
+        self.combine.adopt()
+        node = self.combine.node
+        if node:
+            # A multi-output setup is running: the new device joins it rather
+            # than silently replacing routing that was set up deliberately.
+            keep = set(conf_targets(node)) & self._live(inv)
+            targets = sorted(keep | set(arrived))
+            verb = "added to the combined output"
+        else:
+            targets = arrived[:1]
+            verb = "now playing here"
+
+        dest = activate(self.combine, targets, inv.default_sink, compensate)
+        if dest is None:
+            return "auto-switch: PipeWire refused to build the combined sink"
+        label = self._label(inv, arrived[0])
+        return f"{label} connected — {verb}."
+
+    def _on_disconnect(self, departed: set[str], inv: Inventory,
+                       compensate: bool) -> str:
+        self.combine.adopt()
+        node = self.combine.node
+        if node:
+            remaining = sorted(set(conf_targets(node)) & self._live(inv))
+        elif inv.default_sink in departed or inv.default_sink not in self._live(inv):
+            remaining = []
+        else:
+            # PipeWire beat us to the fallback and the default is already
+            # valid. Nothing to route, but drop the device that left so the
+            # tick list doesn't keep a ghost entry.
+            keep = sorted(set(load_state().get("selected", [])) - departed)
+            save_state(selected=keep)
+            return ""
+
+        if not remaining:
+            fb = fallback_sink(inv.sinks)
+            if not fb:
+                return ""
+            remaining = [fb]
+
+        dest = activate(self.combine, remaining, inv.default_sink, compensate)
+        if dest is None:
+            return ""
+        if len(remaining) == 1:
+            back = next((s.description for s in inv.sinks
+                         if s.name == remaining[0]), remaining[0])
+        else:
+            back = f"the {len(remaining)} remaining outputs"
+        return f"Bluetooth disconnected — audio moved back to {back}."
+
+    @staticmethod
+    def _label(inv: Inventory, sink_name: str) -> str:
+        return next((s.description for s in inv.sinks if s.name == sink_name),
+                    "Bluetooth device")
+
+
+# ---------------------------------------------------------------- event watcher
+
+class PactlWatcher(QThread):
+    """Emits when PipeWire's sink topology changes (device connect/disconnect)."""
+    changed = pyqtSignal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._stop = False
+        self.proc: subprocess.Popen | None = None
+
+    def run(self) -> None:
+        try:
+            self.proc = subprocess.Popen(
+                ["pactl", "subscribe"], stdout=subprocess.PIPE, text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except OSError:
+            return
+        assert self.proc.stdout
+        for line in self.proc.stdout:
+            if self._stop:
+                return
+            if "on sink " in line or "on card " in line or "on server" in line:
+                self.changed.emit()
+
+    def stop(self) -> None:
+        self._stop = True
+        if self.proc and self.proc.poll() is None:
+            self.proc.terminate()
+
+
+# ---------------------------------------------------------------- UI pieces
+
+ICONS = {"bluetooth": "ᵇ", "wired": "♫", "hdmi": "▣", "virtual": "⬡"}
+BADGE = {"bluetooth": "Bluetooth", "wired": "Wired", "hdmi": "HDMI", "virtual": "Virtual"}
+
+
+class SinkRow(QFrame):
+    toggled = pyqtSignal()
+    volume_changed = pyqtSignal(str, int)
+
+    def __init__(self, sink: Sink, checked: bool) -> None:
+        super().__init__()
+        self.sink = sink
+        self.setObjectName("row")
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(12, 9, 12, 9)
+        lay.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.setSpacing(10)
+        self.check = QCheckBox()
+        self.check.setChecked(checked)
+        self.check.stateChanged.connect(lambda _: self.toggled.emit())
+        top.addWidget(self.check)
+
+        title = QLabel(sink.description)
+        f = title.font()
+        f.setPointSizeF(f.pointSizeF() + 0.5)
+        f.setWeight(QFont.Weight.DemiBold)
+        title.setFont(f)
+        top.addWidget(title)
+
+        badge = QLabel(BADGE.get(sink.kind, sink.kind))
+        badge.setObjectName("badge")
+        badge.setProperty("kind", sink.kind)
+        top.addWidget(badge)
+
+        if sink.battery is not None:
+            batt = QLabel(f"{sink.battery}%")
+            batt.setObjectName("dim")
+            top.addWidget(batt)
+
+        top.addStretch(1)
+        lay.addLayout(top)
+
+        vol = QHBoxLayout()
+        vol.setSpacing(8)
+        vol.addSpacing(26)
+        self.slider = QSlider(Qt.Orientation.Horizontal)
+        self.slider.setRange(0, 150)
+        self.slider.setValue(sink.volume)
+        self.slider.setEnabled(not sink.muted)
+        self.slider.valueChanged.connect(self._on_vol)
+        self.vlabel = QLabel(f"{sink.volume}%")
+        self.vlabel.setObjectName("dim")
+        self.vlabel.setFixedWidth(42)
+        vol.addWidget(self.slider, 1)
+        vol.addWidget(self.vlabel)
+        lay.addLayout(vol)
+
+    def _on_vol(self, value: int) -> None:
+        self.vlabel.setText(f"{value}%")
+        self.volume_changed.emit(self.sink.name, value)
+
+
+class OfflineRow(QFrame):
+    connect_requested = pyqtSignal(str)
+
+    def __init__(self, dev: BtDevice) -> None:
+        super().__init__()
+        self.setObjectName("row")
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(12, 9, 12, 9)
+        lay.setSpacing(10)
+        lay.addSpacing(26)
+        name = QLabel(dev.name)
+        name.setObjectName("dim")
+        lay.addWidget(name)
+        badge = QLabel("not connected")
+        badge.setObjectName("badge")
+        badge.setProperty("kind", "off")
+        lay.addWidget(badge)
+        lay.addStretch(1)
+        btn = QPushButton("Connect")
+        btn.setObjectName("ghost")
+        btn.clicked.connect(lambda: self.connect_requested.emit(dev.mac))
+        lay.addWidget(btn)
+
+
+# ---------------------------------------------------------------- main window
+
+class MainWindow(QMainWindow):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Multi-Out")
+        self.resize(560, 640)
+        self.combine = CombineManager()
+        self.selected: set[str] = set()
+        self.compensate = False
+        self.autoswitch = True
+        self.inv = Inventory()
+        self._applying = False
+        self._load_state()
+        self.auto_engine = AutoSwitch(self.combine)
+
+        root = QWidget()
+        self.setCentralWidget(root)
+        outer = QVBoxLayout(root)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # header
+        head = QWidget()
+        head.setObjectName("head")
+        hl = QVBoxLayout(head)
+        hl.setContentsMargins(18, 16, 18, 14)
+        hl.setSpacing(3)
+        t = QLabel("Multi-Out")
+        tf = t.font()
+        tf.setPointSizeF(tf.pointSizeF() + 5)
+        tf.setWeight(QFont.Weight.Bold)
+        t.setFont(tf)
+        hl.addWidget(t)
+        sub = QLabel("Tick every output that should play. Bluetooth, wired and "
+                     "HDMI can run together.")
+        sub.setObjectName("dim")
+        sub.setWordWrap(True)
+        hl.addWidget(sub)
+        outer.addWidget(head)
+
+        # device list
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self.host = QWidget()
+        self.list = QVBoxLayout(self.host)
+        self.list.setContentsMargins(14, 12, 14, 12)
+        self.list.setSpacing(8)
+        self.list.addStretch(1)
+        self.scroll.setWidget(self.host)
+        outer.addWidget(self.scroll, 1)
+
+        # footer
+        foot = QWidget()
+        foot.setObjectName("foot")
+        fl = QVBoxLayout(foot)
+        fl.setContentsMargins(18, 12, 18, 14)
+        fl.setSpacing(10)
+
+        self.auto = QCheckBox("Switch to Bluetooth automatically when a device connects")
+        self.auto.setChecked(self.autoswitch)
+        self.auto.stateChanged.connect(self._on_auto)
+        fl.addWidget(self.auto)
+
+        self.comp = QCheckBox("Compensate for latency differences between devices")
+        self.comp.setChecked(self.compensate)
+        self.comp.stateChanged.connect(self._on_comp)
+        fl.addWidget(self.comp)
+
+        self.status = QLabel("")
+        self.status.setObjectName("dim")
+        self.status.setWordWrap(True)
+        fl.addWidget(self.status)
+
+        btns = QHBoxLayout()
+        btns.setSpacing(8)
+        self.btn_test = QPushButton("Test tone")
+        self.btn_test.setObjectName("ghost")
+        self.btn_test.clicked.connect(self._test_tone)
+        btns.addWidget(self.btn_test)
+        btns.addStretch(1)
+        self.btn_stop = QPushButton("Stop routing")
+        self.btn_stop.setObjectName("ghost")
+        self.btn_stop.clicked.connect(self._stop_routing)
+        btns.addWidget(self.btn_stop)
+        self.btn_apply = QPushButton("Apply")
+        self.btn_apply.setObjectName("primary")
+        self.btn_apply.setDefault(True)
+        self.btn_apply.clicked.connect(self.apply)
+        btns.addWidget(self.btn_apply)
+        fl.addLayout(btns)
+        outer.addWidget(foot)
+
+        self.setStyleSheet(STYLE)
+
+        self.watcher = PactlWatcher()
+        self.watcher.changed.connect(self._debounced_refresh)
+        self.watcher.start()
+
+        self._debounce = QTimer(self)
+        self._debounce.setSingleShot(True)
+        self._debounce.setInterval(400)
+        self._debounce.timeout.connect(self.refresh)
+
+        self.combine.adopt()
+        if self.combine.node:
+            self.status.setText("Adopted the routing already running.")
+        self.refresh()
+
+    # -- state --------------------------------------------------------------
+    def _load_state(self) -> None:
+        d = load_state()
+        self.selected = set(d.get("selected", []))
+        self.compensate = bool(d.get("compensate", False))
+        self.autoswitch = bool(d.get("autoswitch", True))
+
+    def _save_state(self) -> None:
+        save_state(selected=sorted(self.selected),
+                   compensate=self.compensate,
+                   autoswitch=self.autoswitch)
+
+    # -- refresh ------------------------------------------------------------
+    def _debounced_refresh(self) -> None:
+        if not self._applying:
+            self._debounce.start()
+
+    def refresh(self) -> None:
+        self.inv = scan()
+        while self.list.count() > 1:
+            item = self.list.takeAt(0)
+            w = item.widget()
+            if w:
+                w.deleteLater()
+
+        # Virtual sinks (ours or another tool's combine sink) are excluded:
+        # nesting one combine sink inside another loops audio back on itself.
+        real = [s for s in self.inv.sinks if s.kind != "virtual"]
+        for sink in real:
+            row = SinkRow(sink, sink.name in self.selected)
+            row.toggled.connect(self._on_toggle)
+            row.volume_changed.connect(self._set_volume)
+            self.list.insertWidget(self.list.count() - 1, row)
+
+        for dev in self.inv.bt_offline:
+            row = OfflineRow(dev)
+            row.connect_requested.connect(self._connect_bt)
+            self.list.insertWidget(self.list.count() - 1, row)
+
+        # Drop selections whose device went away, so Apply stays honest.
+        live = {s.name for s in real}
+        self.selected &= live
+
+        # With the service running it does the switching; doing it here too
+        # would have two owners racing to set the default sink.
+        if self.autoswitch and not self._applying and not daemon_running():
+            self._applying = True
+            try:
+                msg = self.auto_engine.reconcile(self.inv, self.compensate)
+            finally:
+                self._applying = False
+            if msg:
+                self._load_state()
+                self.status.setText(msg)
+                QTimer.singleShot(400, self.refresh)
+                return
+        elif not self.autoswitch:
+            self.auto_engine.prime(self.inv)
+
+        self._update_status()
+
+    def _on_toggle(self) -> None:
+        self.selected = {
+            r.sink.name
+            for r in self.host.findChildren(SinkRow)
+            if r.check.isChecked()
+        }
+        self._update_status()
+
+    def _update_status(self) -> None:
+        n = len(self.selected)
+        active = self.combine.node or self.inv.default_sink
+        if n == 0:
+            msg = "No outputs ticked."
+        elif n == 1:
+            msg = "1 output ticked — audio routes to it directly."
+        else:
+            msg = f"{n} outputs ticked — they will share one combined sink."
+        if self.combine.node:
+            msg += "  Routing is active."
+        elif active:
+            msg += f"  Currently playing to: {active}"
+        if self.autoswitch:
+            msg += ("  Auto-switch on (service)." if daemon_running()
+                    else "  Auto-switch on (only while this window is open).")
+        self.status.setText(msg)
+        self.btn_stop.setEnabled(bool(self.combine.node))
+
+    # -- actions ------------------------------------------------------------
+    def _on_auto(self) -> None:
+        self.autoswitch = self.auto.isChecked()
+        self._save_state()
+        if self.autoswitch:
+            self.auto_engine.prime(self.inv)
+        self._update_status()
+
+    def _on_comp(self) -> None:
+        self.compensate = self.comp.isChecked()
+        self._save_state()
+        if self.combine.node:
+            self.apply()
+
+    def _set_volume(self, sink_name: str, value: int) -> None:
+        subprocess.run(["pactl", "set-sink-volume", sink_name, f"{value}%"],
+                       capture_output=True)
+
+    def _connect_bt(self, mac: str) -> None:
+        self.status.setText(f"Connecting {mac}…")
+        QApplication.processEvents()
+        subprocess.run(["bluetoothctl", "connect", mac], capture_output=True,
+                       timeout=20)
+        QTimer.singleShot(1500, self.refresh)
+
+    def apply(self) -> None:
+        targets = sorted(self.selected)
+        if not targets:
+            QMessageBox.information(self, "Nothing selected",
+                                    "Tick at least one output first.")
+            return
+
+        self._applying = True
+        self.btn_apply.setEnabled(False)
+        try:
+            if len(targets) > 1:
+                self.status.setText("Building combined sink…")
+                QApplication.processEvents()
+            dest = activate(self.combine, targets, self.inv.default_sink,
+                            self.compensate)
+            if dest is None:
+                QMessageBox.warning(
+                    self, "Could not build combined sink",
+                    "PipeWire refused to start the combine module.\n\n"
+                    f"See {RUNTIME}/multiout-*.log for details.")
+                return
+            # This selection is now the baseline, so auto-switch treats only
+            # later arrivals as new.
+            self.auto_engine.prime(self.inv)
+            self._save_state()
+        finally:
+            self._applying = False
+            self.btn_apply.setEnabled(True)
+        QTimer.singleShot(300, self.refresh)
+
+    def _stop_routing(self) -> None:
+        node = self.combine.node
+        if not node:
+            return
+        fallback = next((s.name for s in self.inv.sinks
+                         if s.kind in ("wired", "bluetooth")), "")
+        if fallback:
+            move_streams(fallback, {node})
+            subprocess.run(["pactl", "set-default-sink", fallback],
+                           capture_output=True)
+        self.combine.kill()
+        QTimer.singleShot(300, self.refresh)
+
+    def _test_tone(self) -> None:
+        wav = f"{RUNTIME}/multiout-tone.wav"
+        if not os.path.exists(wav):
+            import math
+            import struct
+            import wave
+            rate, dur = 48000, 2.0
+            w = wave.open(wav, "w")
+            w.setnchannels(2)
+            w.setsampwidth(2)
+            w.setframerate(rate)
+            frames = bytearray()
+            for i in range(int(rate * dur)):
+                t = i / rate
+                f = 440 if int(t * 2) % 2 == 0 else 660
+                env = min(1.0, t / 0.05, (dur - t) / 0.05)
+                s = int(0.25 * env * 32767 * math.sin(2 * math.pi * f * t))
+                frames += struct.pack("<hh", s, s)
+            w.writeframes(bytes(frames))
+            w.close()
+        dest = self.combine.node or run(["pactl", "get-default-sink"]).strip()
+        if dest:
+            subprocess.Popen(["paplay", f"--device={dest}", wav])
+
+    # -- teardown -----------------------------------------------------------
+    def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+        self.watcher.stop()
+        self.watcher.wait(1500)
+        # Leave routing running on purpose: closing the window should not cut
+        # the audio the user just set up.
+        event.accept()
+
+
+STYLE = """
+QMainWindow, QWidget { background: palette(window); }
+#head { background: palette(base); border-bottom: 1px solid palette(mid); }
+#foot { background: palette(base); border-top: 1px solid palette(mid); }
+#row  { background: palette(base); border: 1px solid palette(mid);
+        border-radius: 9px; }
+#row:hover { border-color: palette(highlight); }
+#dim  { color: palette(placeholder-text); }
+#badge { color: palette(placeholder-text); border: 1px solid palette(mid);
+         border-radius: 7px; padding: 1px 7px; font-size: 10px; }
+QPushButton { padding: 6px 15px; border-radius: 7px; }
+#primary { background: palette(highlight); color: palette(highlighted-text);
+           border: none; font-weight: 600; }
+#primary:disabled { background: palette(mid); color: palette(placeholder-text); }
+#ghost { background: transparent; border: 1px solid palette(mid); }
+#ghost:hover { border-color: palette(highlight); }
+#ghost:disabled { color: palette(placeholder-text); border-color: palette(mid); }
+QSlider::groove:horizontal { height: 4px; background: palette(mid);
+                             border-radius: 2px; }
+QSlider::handle:horizontal { width: 13px; height: 13px; margin: -5px 0;
+                             border-radius: 7px; background: palette(highlight); }
+QSlider::sub-page:horizontal { background: palette(highlight);
+                               border-radius: 2px; }
+"""
+
+
+def daemon() -> int:
+    """Headless auto-switch: no window, no Qt event loop. Watches PipeWire and
+    hands audio to a Bluetooth device as soon as one shows up."""
+    lock = open(f"{RUNTIME}/multiout-daemon.lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("multiout: auto-switch daemon already running", file=sys.stderr)
+        return 0
+
+    combine = CombineManager()
+    combine.adopt()
+    auto = AutoSwitch(combine)
+    auto.prime(scan())
+    print("multiout: auto-switch daemon watching for Bluetooth outputs",
+          flush=True)
+
+    while True:
+        try:
+            proc = subprocess.Popen(
+                ["pactl", "subscribe"], stdout=subprocess.PIPE, text=True,
+                stderr=subprocess.DEVNULL)
+        except OSError:
+            time.sleep(5)
+            continue
+
+        pending = 0.0
+        try:
+            assert proc.stdout
+            while proc.poll() is None:
+                ready, _, _ = select.select(
+                    [proc.stdout], [], [], DEBOUNCE if pending else None)
+                if ready:
+                    line = proc.stdout.readline()
+                    if not line:
+                        break
+                    if ("on sink " in line or "on card " in line
+                            or "on server" in line):
+                        pending = time.monotonic()
+                    continue
+                if pending and time.monotonic() - pending >= DEBOUNCE:
+                    pending = 0.0
+                    st = load_state()
+                    inv = scan()
+                    if st.get("autoswitch", True):
+                        msg = auto.reconcile(inv, bool(st.get("compensate")))
+                        if msg:
+                            print(f"multiout: {msg}", flush=True)
+                    else:
+                        auto.prime(inv)
+        finally:
+            if proc.poll() is None:
+                proc.terminate()
+
+        # PipeWire restarted or the socket went away: resync and reattach.
+        time.sleep(2)
+        combine.adopt()
+        auto.prime(scan())
+
+
+def main() -> int:
+    for tool in ("pactl", "pipewire", "bluetoothctl"):
+        if not shutil.which(tool):
+            print(f"multiout: required tool not found: {tool}", file=sys.stderr)
+            return 1
+
+    if "--daemon" in sys.argv[1:]:
+        return daemon()
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Multi-Out")
+    app.setDesktopFileName("multiout")
+    win = MainWindow()
+    win.show()
+    return app.exec()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

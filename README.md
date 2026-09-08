@@ -61,12 +61,26 @@ window defers to the service whenever the service is running.
 
 State lives in `~/.local/share/multiout/state.json`.
 
+## Windows
+
+There is a Windows port in [`windows/`](windows/), with the same window and the
+same auto-switch behaviour. It is **untested** — written on Linux, never yet run
+on Windows — so start with `python multiout.py --selftest`, which reports what it
+detects without changing anything.
+
+It differs in one way that matters: Windows has no combine sink, so playing to
+several outputs at once is done by loopback-capturing the primary and mirroring
+it to the extras, which trail by roughly 30-80 ms. See
+[windows/README.md](windows/README.md).
+
 ## Layout
 
 ```
-linux/multiout          the application (GUI + --daemon)
+linux/multiout          the Linux application (GUI + --daemon)
 linux/install.sh        user-local installer
 packaging/              .desktop entry and systemd user unit
+windows/multiout.py     the Windows port (GUI + --daemon + --selftest)
+windows/install.ps1     Start Menu shortcut and logon task
 ```
 
 ## Licence

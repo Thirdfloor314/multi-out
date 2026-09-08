@@ -3,3 +3,7 @@ __pycache__/
 *.bak-*
 *.egg-info/
 .venv/
+build/
+dist/
+Output/
+*.spec

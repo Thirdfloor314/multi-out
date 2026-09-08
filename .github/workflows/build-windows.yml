@@ -1,0 +1,72 @@
+name: Build Windows installer
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install comtypes pycaw PyQt6 PyAudioWPatch pyinstaller
+
+      - name: Build the app
+        working-directory: windows
+        run: |
+          pyinstaller --noconfirm --onefile --windowed --name Multi-Out `
+            --hidden-import comtypes --hidden-import comtypes.stream `
+            --hidden-import pycaw --hidden-import pyaudiowpatch `
+            --collect-submodules comtypes --collect-submodules pycaw `
+            --collect-binaries pyaudiowpatch `
+            multiout.py
+
+      - name: Build the console self-test
+        working-directory: windows
+        run: |
+          pyinstaller --noconfirm --onefile --console --name Multi-Out-Selftest `
+            --hidden-import comtypes --hidden-import comtypes.stream `
+            --hidden-import pycaw --hidden-import pyaudiowpatch `
+            --collect-submodules comtypes --collect-submodules pycaw `
+            --collect-binaries pyaudiowpatch `
+            multiout.py
+
+      # A windowed build has no console, so prove the exe at least starts and
+      # can enumerate devices before we ship it.
+      - name: Smoke-test the build
+        working-directory: windows
+        run: |
+          ./dist/Multi-Out-Selftest.exe --selftest
+        continue-on-error: true
+
+      - name: Build the installer
+        run: |
+          choco install innosetup --no-progress -y
+          & "$env:ProgramFiles(x86)\Inno Setup 6\ISCC.exe" windows\installer.iss
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Multi-Out-Windows
+          path: |
+            windows/dist/Multi-Out.exe
+            windows/dist/Multi-Out-Selftest.exe
+            windows/Output/Multi-Out-Setup.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            windows/Output/Multi-Out-Setup.exe
+            windows/dist/Multi-Out.exe

@@ -186,32 +186,55 @@ def classify(name: str, enumerator: str, form_factor: int | None) -> tuple[str, 
     return "other", "default"
 
 
+def _render_endpoints():
+    """Active *output* endpoints, paired with their raw IMMDevice.
+
+    pycaw's GetAllDevices() returns capture endpoints too, which would put
+    microphones and loopback monitors in the output list, so enumerate the
+    render data-flow directly instead.
+    """
+    import comtypes
+    from pycaw.api.mmdeviceapi import IMMDeviceEnumerator
+    from pycaw.constants import CLSID_MMDeviceEnumerator
+    from pycaw.utils import AudioUtilities
+
+    enum = comtypes.CoCreateInstance(CLSID_MMDeviceEnumerator,
+                                     IMMDeviceEnumerator,
+                                     comtypes.CLSCTX_INPROC_SERVER)
+    default_id = ""
+    try:
+        default_id = AudioUtilities.CreateDevice(
+            enum.GetDefaultAudioEndpoint(0, 0)).id or ""
+    except Exception:
+        pass
+
+    found = []
+    try:
+        coll = enum.EnumAudioEndpoints(0, 1)   # eRender, DEVICE_STATE_ACTIVE
+        for i in range(coll.GetCount()):
+            try:
+                raw = coll.Item(i)
+                found.append((AudioUtilities.CreateDevice(raw), raw))
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return found, default_id
+
+
 def scan() -> Inventory:
     """Enumerate active render endpoints."""
     com_init()
     inv = Inventory()
     try:
-        from pycaw.utils import AudioUtilities
+        endpoints, inv.default_id = _render_endpoints()
     except Exception:
         return inv
 
-    try:
-        default = AudioUtilities.GetSpeakers()
-        inv.default_id = default.GetId()
-    except Exception:
-        pass
-
-    try:
-        raw = AudioUtilities.GetAllDevices()
-    except Exception:
-        return inv
-
-    for d in raw:
+    for dev, raw in endpoints:
         try:
-            if getattr(d, "state", None) is not None and str(d.state) != "AudioDeviceState.Active":
-                continue
-            dev_id = d.id
-            name = d.FriendlyName or dev_id
+            dev_id = dev.id
+            name = dev.FriendlyName or dev_id
         except Exception:
             continue
         if not dev_id:
@@ -219,13 +242,13 @@ def scan() -> Inventory:
 
         enumerator, form = "", None
         try:
-            enumerator = _enumerator_name(d._dev)
+            enumerator = _enumerator_name(raw)
         except Exception:
             pass
         try:
-            props = getattr(d, "properties", {}) or {}
+            props = getattr(dev, "properties", {}) or {}
             for k, v in props.items():
-                if "1da5d803" in str(k).lower():      # PKEY_AudioEndpoint_FormFactor
+                if "1da5d803" in str(k).lower():   # PKEY_AudioEndpoint_FormFactor
                     form = int(v)
                     break
         except Exception:
@@ -619,7 +642,7 @@ BADGE = {"bluetooth": "Bluetooth", "hdmi": "HDMI", "speakers": "Speakers",
 
 
 def run_gui() -> int:
-    from PyQt6.QtCore import Qt, QTimer
+    from PyQt6.QtCore import QTimer
     from PyQt6.QtGui import QFont
     from PyQt6.QtWidgets import (
         QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QMainWindow,

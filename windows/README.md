@@ -9,13 +9,27 @@ Same idea as the Linux build, different machinery underneath.
 
 ## Install
 
+**The easy way — a real installer, no Python needed.** Push a tag and GitHub
+Actions builds it on a real Windows runner:
+
+```sh
+git tag v1.0.0 && git push origin v1.0.0
+```
+
+`Multi-Out-Setup.exe` then appears on the release page. It installs per-user, so
+it never asks for admin rights, and optionally registers the auto-switch task to
+run at logon. Every push to `main` also produces the exes as a build artifact if
+you would rather not cut a release.
+
+**From source**, if you already have Python 3:
+
 ```powershell
 python multiout.py --selftest        # look before you leap
 powershell -ExecutionPolicy Bypass -File install.ps1
 ```
 
-Needs Python 3, plus `comtypes`, `pycaw`, `PyQt6` and `PyAudioWPatch`, which the
-installer pulls in. No admin rights required.
+Needs `comtypes`, `pycaw`, `PyQt6` and `PyAudioWPatch`, which the installer
+pulls in. No admin rights required.
 
 ## How it differs from Linux
 

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Multi-Out Bluetooth auto-switch LaunchAgent (macOS).
+
+  __MULTIOUT__ and __PYTHON__ are placeholders; mac/install.sh rewrites them to
+  the installed program and the python3 path. It reconnects on its own when
+  CoreAudio state changes, so KeepAlive is all the supervision it needs.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.multiout-autoswitch</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>__PYTHON__</string>
+        <string>__MULTIOUT__</string>
+        <string>--daemon</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <true/>
+
+    <key>ThrottleInterval</key>
+    <integer>3</integer>
+
+    <key>ProcessType</key>
+    <string>Interactive</string>
+
+    <key>StandardOutPath</key>
+    <string>__HOME__/Library/Logs/multiout-autoswitch.log</string>
+    <key>StandardErrorPath</key>
+    <string>__HOME__/Library/Logs/multiout-autoswitch.log</string>
+</dict>
+</plist>

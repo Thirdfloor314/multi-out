@@ -1,0 +1,1075 @@
+#!/usr/bin/env python3
+"""
+Multi-Out (macOS) — route audio to several outputs at once.
+
+The macOS port of the Linux Multi-Out. Where the Linux build stitched a
+PipeWire combine sink together, this one builds a CoreAudio *Multi-Output
+device* (a non-stacked aggregate) over whichever outputs you tick and makes it
+the system default, so the same audio plays on Bluetooth, built-in, HDMI and
+AirPlay together. Tick one output and it just becomes the default directly —
+no aggregate is built.
+
+Run with --daemon for the headless auto-switch agent (a launchd LaunchAgent):
+it watches CoreAudio and points audio at a Bluetooth device the moment one
+connects, folding it into any multi-output you already have running.
+
+CoreAudio is reached two ways, on purpose:
+  * ctypes against the CoreAudio framework for every AudioObject property
+    read/write — deterministic pointer handling across OS and PyObjC versions.
+  * PyObjC (Foundation) only to assemble the aggregate-device description
+    dictionary, where a hand-rolled CFDictionary would be needlessly fragile.
+
+Requires: macOS, python3, PyObjC (`pip install pyobjc-core pyobjc-framework-Cocoa`),
+and PyQt6 for the window (`pip install PyQt6`). The --daemon mode needs neither
+PyQt6 nor a display.
+"""
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import fcntl
+import json
+import math
+import os
+import struct
+import subprocess
+import sys
+import time
+import uuid
+import wave
+from ctypes import (
+    POINTER, Structure, byref, c_char_p, c_float, c_long, c_ubyte, c_uint32,
+    c_int32, c_void_p, create_string_buffer, sizeof,
+)
+from dataclasses import dataclass, field
+
+SUPPORT = os.path.expanduser("~/Library/Application Support/Multi-Out")
+STATE = os.path.join(SUPPORT, "state.json")
+RUNTIME = os.path.join(
+    os.environ.get("TMPDIR", "/tmp").rstrip("/"), "multiout")
+LABEL = "com.user.multiout-autoswitch"
+POLL = 2.0  # seconds between CoreAudio device scans
+
+
+# ---------------------------------------------------------------- fourcc / consts
+
+def fourcc(s: str) -> int:
+    """CoreAudio selectors are four-char codes packed big-endian."""
+    b = s.encode("ascii")
+    return (b[0] << 24) | (b[1] << 16) | (b[2] << 8) | b[3]
+
+
+kAudioObjectSystemObject = 1
+kAudioObjectPropertyElementMain = 0
+
+SEL_DEVICES = fourcc("dev#")          # kAudioHardwarePropertyDevices
+SEL_DEFAULT_OUT = fourcc("dOut")      # kAudioHardwarePropertyDefaultOutputDevice
+SEL_UID = fourcc("uid ")              # kAudioDevicePropertyDeviceUID
+SEL_NAME = fourcc("lnam")             # kAudioObjectPropertyName
+SEL_TRANSPORT = fourcc("tran")        # kAudioDevicePropertyTransportType
+SEL_STREAMS = fourcc("slay")          # kAudioDevicePropertyStreamConfiguration
+SEL_VOLUME = fourcc("volm")           # kAudioDevicePropertyVolumeScalar
+
+SCOPE_GLOBAL = fourcc("glob")
+SCOPE_OUTPUT = fourcc("outp")
+
+TRANSPORT = {
+    fourcc("blue"): "bluetooth",
+    fourcc("bltn"): "wired",
+    fourcc("usb "): "wired",
+    fourcc("hdmi"): "hdmi",
+    fourcc("dprt"): "hdmi",
+    fourcc("airp"): "airplay",
+    fourcc("grup"): "virtual",   # another aggregate / multi-output device
+    fourcc("virt"): "virtual",
+}
+
+# Aggregate-device description keys (stable string values from AudioHardware.h).
+K_NAME = "name"
+K_UID = "uid"
+K_SUBLIST = "subdevices"
+K_MASTER = "master"
+K_PRIVATE = "private"
+K_STACKED = "stacked"
+K_SUB_UID = "uid"
+K_SUB_DRIFT = "drift"
+
+# A Multi-Output device (same stream mirrored to every sub-device) is an
+# aggregate with stacked = 0; stacked = 1 would concatenate channels into a
+# classic aggregate instead. Flip this one flag if a future macOS reverses the
+# sense of the key.
+MULTI_OUTPUT_STACKED = False
+
+
+# ---------------------------------------------------------------- CoreAudio bridge
+
+core: ctypes.CDLL | None = None
+cf: ctypes.CDLL | None = None
+kCFStringEncodingUTF8 = 0x08000100
+
+
+class AudioObjectPropertyAddress(Structure):
+    _fields_ = [("mSelector", c_uint32),
+                ("mScope", c_uint32),
+                ("mElement", c_uint32)]
+
+
+def load_ca() -> bool:
+    """Load and configure the CoreAudio / CoreFoundation entry points. Returns
+    False off macOS (or if the frameworks are missing) so callers can bail with
+    a clear message rather than an import-time crash."""
+    global core, cf
+    if core is not None:
+        return True
+    ca_path = ctypes.util.find_library("CoreAudio")
+    cf_path = ctypes.util.find_library("CoreFoundation")
+    if not ca_path or not cf_path:
+        return False
+    core = ctypes.CDLL(ca_path)
+    cf = ctypes.CDLL(cf_path)
+
+    addr_p = POINTER(AudioObjectPropertyAddress)
+
+    core.AudioObjectGetPropertyDataSize.restype = c_int32
+    core.AudioObjectGetPropertyDataSize.argtypes = [
+        c_uint32, addr_p, c_uint32, c_void_p, POINTER(c_uint32)]
+    core.AudioObjectGetPropertyData.restype = c_int32
+    core.AudioObjectGetPropertyData.argtypes = [
+        c_uint32, addr_p, c_uint32, c_void_p, POINTER(c_uint32), c_void_p]
+    core.AudioObjectSetPropertyData.restype = c_int32
+    core.AudioObjectSetPropertyData.argtypes = [
+        c_uint32, addr_p, c_uint32, c_void_p, c_uint32, c_void_p]
+    core.AudioObjectHasProperty.restype = c_ubyte
+    core.AudioObjectHasProperty.argtypes = [c_uint32, addr_p]
+    core.AudioObjectIsPropertySettable.restype = c_int32
+    core.AudioObjectIsPropertySettable.argtypes = [
+        c_uint32, addr_p, POINTER(c_ubyte)]
+    core.AudioHardwareCreateAggregateDevice.restype = c_int32
+    core.AudioHardwareCreateAggregateDevice.argtypes = [
+        c_void_p, POINTER(c_uint32)]
+    core.AudioHardwareDestroyAggregateDevice.restype = c_int32
+    core.AudioHardwareDestroyAggregateDevice.argtypes = [c_uint32]
+
+    cf.CFStringGetLength.restype = c_long
+    cf.CFStringGetLength.argtypes = [c_void_p]
+    cf.CFStringGetCString.restype = c_ubyte
+    cf.CFStringGetCString.argtypes = [c_void_p, c_char_p, c_long, c_uint32]
+    cf.CFRelease.argtypes = [c_void_p]
+    return True
+
+
+def _addr(selector: int, scope: int = SCOPE_GLOBAL,
+          element: int = kAudioObjectPropertyElementMain
+          ) -> AudioObjectPropertyAddress:
+    return AudioObjectPropertyAddress(selector, scope, element)
+
+
+def _cfstr_to_str(ref: c_void_p) -> str:
+    if not ref:
+        return ""
+    length = cf.CFStringGetLength(ref)
+    buf = create_string_buffer((length * 4) + 1)
+    ok = cf.CFStringGetCString(ref, buf, len(buf), kCFStringEncodingUTF8)
+    return buf.value.decode("utf-8", "replace") if ok else ""
+
+
+class CA:
+    """Thin CoreAudio accessors. Every call returns a sane default on failure
+    rather than raising, so a device vanishing mid-scan is a non-event."""
+
+    @staticmethod
+    def device_ids() -> list[int]:
+        addr = _addr(SEL_DEVICES)
+        size = c_uint32(0)
+        if core.AudioObjectGetPropertyDataSize(
+                kAudioObjectSystemObject, byref(addr), 0, None, byref(size)):
+            return []
+        n = size.value // sizeof(c_uint32)
+        arr = (c_uint32 * n)()
+        if core.AudioObjectGetPropertyData(
+                kAudioObjectSystemObject, byref(addr), 0, None,
+                byref(size), arr):
+            return []
+        return list(arr)
+
+    @staticmethod
+    def _u32(obj: int, selector: int, scope: int = SCOPE_GLOBAL) -> int | None:
+        addr = _addr(selector, scope)
+        val = c_uint32(0)
+        size = c_uint32(sizeof(val))
+        if core.AudioObjectGetPropertyData(
+                obj, byref(addr), 0, None, byref(size), byref(val)):
+            return None
+        return val.value
+
+    @staticmethod
+    def _cfstr(obj: int, selector: int, scope: int = SCOPE_GLOBAL) -> str:
+        addr = _addr(selector, scope)
+        ref = c_void_p(0)
+        size = c_uint32(sizeof(ref))
+        if core.AudioObjectGetPropertyData(
+                obj, byref(addr), 0, None, byref(size), byref(ref)):
+            return ""
+        if not ref.value:
+            return ""
+        out = _cfstr_to_str(ref)
+        cf.CFRelease(ref)
+        return out
+
+    @staticmethod
+    def device_uid(dev: int) -> str:
+        return CA._cfstr(dev, SEL_UID)
+
+    @staticmethod
+    def device_name(dev: int) -> str:
+        return CA._cfstr(dev, SEL_NAME) or CA.device_uid(dev)
+
+    @staticmethod
+    def kind(dev: int) -> str:
+        return TRANSPORT.get(CA._u32(dev, SEL_TRANSPORT) or 0, "wired")
+
+    @staticmethod
+    def has_output(dev: int) -> bool:
+        addr = _addr(SEL_STREAMS, SCOPE_OUTPUT)
+        size = c_uint32(0)
+        if core.AudioObjectGetPropertyDataSize(
+                dev, byref(addr), 0, None, byref(size)) or size.value < 4:
+            return False
+        buf = (c_ubyte * size.value)()
+        if core.AudioObjectGetPropertyData(
+                dev, byref(addr), 0, None, byref(size), buf):
+            return False
+        # AudioBufferList begins with UInt32 mNumberBuffers.
+        nbuf = c_uint32.from_buffer(buf).value
+        return nbuf > 0
+
+    @staticmethod
+    def get_volume(dev: int) -> int | None:
+        for el in (0, 1):
+            addr = _addr(SEL_VOLUME, SCOPE_OUTPUT, el)
+            if not core.AudioObjectHasProperty(dev, byref(addr)):
+                continue
+            val = c_float(0.0)
+            size = c_uint32(sizeof(val))
+            if core.AudioObjectGetPropertyData(
+                    dev, byref(addr), 0, None, byref(size), byref(val)) == 0:
+                return max(0, min(100, round(val.value * 100)))
+        return None
+
+    @staticmethod
+    def set_volume(dev: int, percent: int) -> None:
+        val = c_float(max(0, min(100, percent)) / 100.0)
+        for el in (0, 1, 2):
+            addr = _addr(SEL_VOLUME, SCOPE_OUTPUT, el)
+            settable = c_ubyte(0)
+            if core.AudioObjectIsPropertySettable(
+                    dev, byref(addr), byref(settable)) == 0 and settable.value:
+                core.AudioObjectSetPropertyData(
+                    dev, byref(addr), 0, None, sizeof(val), byref(val))
+
+    @staticmethod
+    def get_default_output() -> int | None:
+        return CA._u32(kAudioObjectSystemObject, SEL_DEFAULT_OUT)
+
+    @staticmethod
+    def set_default_output(dev: int) -> bool:
+        addr = _addr(SEL_DEFAULT_OUT)
+        val = c_uint32(dev)
+        return core.AudioObjectSetPropertyData(
+            kAudioObjectSystemObject, byref(addr), 0, None,
+            sizeof(val), byref(val)) == 0
+
+    # -- aggregate / multi-output device -----------------------------------
+    @staticmethod
+    def create_aggregate(description) -> int | None:
+        """description is a Foundation NSDictionary. Returns the new device id."""
+        import objc
+        out = c_uint32(0)
+        err = core.AudioHardwareCreateAggregateDevice(
+            c_void_p(objc.pyobjc_id(description)), byref(out))
+        return out.value if err == 0 and out.value else None
+
+    @staticmethod
+    def destroy_aggregate(dev: int) -> None:
+        core.AudioHardwareDestroyAggregateDevice(dev)
+
+
+# ---------------------------------------------------------------- Foundation dict
+
+def _to_ns(obj):
+    """Recursively bridge plain Python containers to Foundation objects, so the
+    aggregate description is a genuine NSDictionary tree before it crosses into
+    ctypes as a CFDictionaryRef."""
+    from Foundation import NSArray, NSDictionary, NSNumber, NSString
+    if isinstance(obj, bool):
+        return NSNumber.numberWithInt_(1 if obj else 0)
+    if isinstance(obj, int):
+        return NSNumber.numberWithInt_(obj)
+    if isinstance(obj, str):
+        return NSString.stringWithString_(obj)
+    if isinstance(obj, list):
+        return NSArray.arrayWithArray_([_to_ns(x) for x in obj])
+    if isinstance(obj, dict):
+        keys = [NSString.stringWithString_(k) for k in obj]
+        vals = [_to_ns(v) for v in obj.values()]
+        return NSDictionary.dictionaryWithObjects_forKeys_(vals, keys)
+    return obj
+
+
+def aggregate_description(uid: str, name: str, sub_uids: list[str],
+                          master_uid: str, compensate: bool):
+    subs = []
+    for u in sub_uids:
+        d = {K_SUB_UID: u}
+        if compensate and u != master_uid:
+            d[K_SUB_DRIFT] = 1
+        subs.append(d)
+    desc = {
+        K_NAME: name,
+        K_UID: uid,
+        K_SUBLIST: subs,
+        K_MASTER: master_uid,
+        K_PRIVATE: 0,
+        K_STACKED: 1 if MULTI_OUTPUT_STACKED else 0,
+    }
+    return _to_ns(desc)
+
+
+# ---------------------------------------------------------------- state file
+
+def load_state() -> dict:
+    try:
+        with open(STATE) as fh:
+            d = json.load(fh)
+        if isinstance(d, dict):
+            return d
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+def save_state(**changes) -> None:
+    """Merge keys into the state file. The window and the agent both write here,
+    so this must never rewrite the whole document from one side's view."""
+    d = load_state()
+    d.update(changes)
+    try:
+        os.makedirs(SUPPORT, exist_ok=True)
+        tmp = f"{STATE}.tmp"
+        with open(tmp, "w") as fh:
+            json.dump(d, fh)
+        os.replace(tmp, STATE)
+    except OSError:
+        pass
+
+
+def daemon_running() -> bool:
+    """True when the launchd auto-switch agent is loaded and owns switching."""
+    try:
+        return subprocess.run(
+            ["launchctl", "list", LABEL],
+            capture_output=True, timeout=3).returncode == 0
+    except (subprocess.SubprocessError, OSError):
+        return False
+
+
+# ---------------------------------------------------------------- data model
+
+@dataclass
+class Device:
+    id: int
+    uid: str
+    name: str
+    kind: str            # bluetooth | wired | hdmi | airplay | virtual
+    volume: int | None   # 0-100 percent, or None when the device has no control
+
+    @property
+    def is_ours(self) -> bool:
+        return self.uid.startswith(MultiOut.UID_PREFIX)
+
+
+@dataclass
+class Inventory:
+    devices: list[Device] = field(default_factory=list)
+    default_uid: str = ""
+
+    def by_uid(self, uid: str) -> Device | None:
+        return next((d for d in self.devices if d.uid == uid), None)
+
+    def live_uids(self) -> set[str]:
+        return {d.uid for d in self.devices if d.kind != "virtual"}
+
+
+def scan() -> Inventory:
+    inv = Inventory()
+    default = CA.get_default_output()
+    for dev in CA.device_ids():
+        if not CA.has_output(dev):
+            continue
+        uid = CA.device_uid(dev)
+        if not uid:
+            continue
+        d = Device(dev, uid, CA.device_name(dev), CA.kind(dev),
+                   CA.get_volume(dev))
+        inv.devices.append(d)
+        if dev == default:
+            inv.default_uid = uid
+    order = {"bluetooth": 0, "wired": 1, "hdmi": 2, "airplay": 3, "virtual": 4}
+    inv.devices.sort(key=lambda d: (order.get(d.kind, 9), d.name.lower()))
+    return inv
+
+
+# ---------------------------------------------------------------- multi-output
+
+class MultiOut:
+    """Owns the Multi-Output (aggregate) device we build. Unlike the Linux
+    combine sink there is no host process to track: the device persists in
+    CoreAudio until destroyed, so "adopting" is just finding our own device by
+    its UID prefix."""
+
+    UID_PREFIX = "multiout:"
+    NAME = "Multi-Out"
+
+    def __init__(self) -> None:
+        self.dev: int | None = None
+        self.uid: str = ""
+
+    @property
+    def active(self) -> bool:
+        return self.dev is not None
+
+    def _ours(self) -> list[tuple[int, str]]:
+        found = []
+        for dev in CA.device_ids():
+            uid = CA.device_uid(dev)
+            if uid.startswith(self.UID_PREFIX):
+                found.append((dev, uid))
+        return found
+
+    def adopt(self) -> None:
+        """Take ownership of a Multi-Out device already in CoreAudio (ours from
+        a previous run), reaping any extras so only one survives."""
+        ours = self._ours()
+        for dev, _ in ours[1:]:
+            CA.destroy_aggregate(dev)
+        if ours:
+            self.dev, self.uid = ours[0]
+        else:
+            self.dev, self.uid = None, ""
+
+    @staticmethod
+    def _master(inv: Inventory, targets: list[str]) -> str:
+        """Pick the clock master: a wired/built-in output is the most stable
+        clock, so prefer it over HDMI, AirPlay and Bluetooth."""
+        pref = {"wired": 0, "hdmi": 1, "airplay": 2, "bluetooth": 3}
+        best, rank = targets[0], 99
+        for u in targets:
+            d = inv.by_uid(u)
+            r = pref.get(d.kind, 9) if d else 9
+            if r < rank:
+                best, rank = u, r
+        return best
+
+    def build(self, inv: Inventory, targets: list[str],
+              compensate: bool) -> int | None:
+        uid = self.UID_PREFIX + str(uuid.uuid4())
+        master = self._master(inv, targets)
+        desc = aggregate_description(uid, self.NAME, targets, master, compensate)
+        dev = CA.create_aggregate(desc)
+        if dev is None:
+            return None
+        self.dev, self.uid = dev, uid
+        return dev
+
+    def kill(self) -> None:
+        for dev, _ in self._ours():
+            CA.destroy_aggregate(dev)
+        self.dev, self.uid = None, ""
+
+
+def fallback_uid(inv: Inventory) -> str:
+    """Where audio should land when every output in use has gone away."""
+    for kind in ("wired", "hdmi"):
+        for d in inv.devices:
+            if d.kind == kind:
+                return d.uid
+    return ""
+
+
+def activate(combine: MultiOut, inv: Inventory, targets: list[str],
+             compensate: bool) -> str | None:
+    """Point the system default at `targets`, building a Multi-Output device
+    when there is more than one. The new device is made default before any old
+    one of ours is torn down, so there is no silent gap.
+
+    Returns the destination UID, or None if the device could not be built.
+    """
+    targets = sorted(set(targets))
+    if not targets:
+        return None
+
+    previous = combine._ours()
+
+    if len(targets) == 1:
+        dev = inv.by_uid(targets[0])
+        if dev is None:
+            return None
+        CA.set_default_output(dev.id)
+        dest_uid = targets[0]
+        combine.dev, combine.uid = None, ""
+    else:
+        dev = combine.build(inv, targets, compensate)
+        if dev is None:
+            return None
+        CA.set_default_output(dev)
+        dest_uid = combine.uid
+
+    # Tear down any earlier Multi-Out of ours, now that the default has moved.
+    for d, _ in previous:
+        if d != combine.dev:
+            CA.destroy_aggregate(d)
+
+    save_state(selected=targets)
+    return dest_uid
+
+
+# ---------------------------------------------------------------- auto-switch
+
+class AutoSwitch:
+    """Follows Bluetooth outputs appearing and disappearing.
+
+    Edge-triggered: it acts on a device *arriving* or *leaving*, never on it
+    merely being present, so it leaves a hand-made selection alone.
+    """
+
+    def __init__(self, combine: MultiOut) -> None:
+        self.combine = combine
+        self.known: set[str] = set()
+        self.primed = False
+
+    @staticmethod
+    def _bt(inv: Inventory) -> set[str]:
+        return {d.uid for d in inv.devices if d.kind == "bluetooth"}
+
+    def prime(self, inv: Inventory) -> None:
+        self.known = self._bt(inv)
+        self.primed = True
+
+    def reconcile(self, inv: Inventory, compensate: bool) -> str:
+        current = self._bt(inv)
+        if not self.primed:
+            self.prime(inv)
+            return ""
+        arrived = sorted(current - self.known)
+        departed = self.known - current
+        self.known = current
+        if arrived:
+            return self._on_connect(arrived, inv, compensate)
+        if departed:
+            return self._on_disconnect(departed, inv, compensate)
+        return ""
+
+    def _on_connect(self, arrived: list[str], inv: Inventory,
+                    compensate: bool) -> str:
+        self.combine.adopt()
+        if self.combine.active:
+            # A multi-output setup is running: the new device joins it rather
+            # than replacing routing that was set up deliberately.
+            keep = set(load_state().get("selected", [])) & inv.live_uids()
+            targets = sorted(keep | set(arrived))
+            verb = "added to the combined output"
+        else:
+            targets = arrived[:1]
+            verb = "now playing here"
+
+        dest = activate(self.combine, inv, targets, compensate)
+        if dest is None:
+            return "auto-switch: CoreAudio refused to build the combined device"
+        label = self._label(inv, arrived[0])
+        return f"{label} connected — {verb}."
+
+    def _on_disconnect(self, departed: set[str], inv: Inventory,
+                       compensate: bool) -> str:
+        self.combine.adopt()
+        live = inv.live_uids()
+        if self.combine.active:
+            remaining = sorted(set(load_state().get("selected", [])) & live)
+        elif inv.default_uid in departed or inv.default_uid not in live:
+            remaining = []
+        else:
+            # The default is still a live device; nothing to reroute. Just drop
+            # the departed device from the saved selection.
+            keep = sorted(set(load_state().get("selected", [])) - departed)
+            save_state(selected=keep)
+            return ""
+
+        if not remaining:
+            fb = fallback_uid(inv)
+            if not fb:
+                return ""
+            remaining = [fb]
+
+        dest = activate(self.combine, inv, remaining, compensate)
+        if dest is None:
+            return ""
+        if len(remaining) == 1:
+            d = inv.by_uid(remaining[0])
+            back = d.name if d else remaining[0]
+        else:
+            back = f"the {len(remaining)} remaining outputs"
+        return f"Bluetooth disconnected — audio moved back to {back}."
+
+    @staticmethod
+    def _label(inv: Inventory, uid: str) -> str:
+        d = inv.by_uid(uid)
+        return d.name if d else "Bluetooth device"
+
+
+# ---------------------------------------------------------------- GUI
+
+def run_gui() -> int:
+    from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal
+    from PyQt6.QtGui import QFont
+    from PyQt6.QtWidgets import (
+        QApplication, QCheckBox, QFrame, QHBoxLayout, QLabel, QMainWindow,
+        QMessageBox, QPushButton, QScrollArea, QSlider, QVBoxLayout, QWidget,
+    )
+
+    BADGE = {"bluetooth": "Bluetooth", "wired": "Wired", "hdmi": "HDMI",
+             "airplay": "AirPlay", "virtual": "Virtual"}
+
+    class DeviceRow(QFrame):
+        toggled = pyqtSignal()
+        volume_changed = pyqtSignal(int, int)   # device id, percent
+
+        def __init__(self, dev: Device, checked: bool) -> None:
+            super().__init__()
+            self.dev = dev
+            self.setObjectName("row")
+            lay = QVBoxLayout(self)
+            lay.setContentsMargins(12, 9, 12, 9)
+            lay.setSpacing(6)
+
+            top = QHBoxLayout()
+            top.setSpacing(10)
+            self.check = QCheckBox()
+            self.check.setChecked(checked)
+            self.check.stateChanged.connect(lambda _: self.toggled.emit())
+            top.addWidget(self.check)
+
+            title = QLabel(dev.name)
+            f = title.font()
+            f.setPointSizeF(f.pointSizeF() + 0.5)
+            f.setWeight(QFont.Weight.DemiBold)
+            title.setFont(f)
+            top.addWidget(title)
+
+            badge = QLabel(BADGE.get(dev.kind, dev.kind))
+            badge.setObjectName("badge")
+            badge.setProperty("kind", dev.kind)
+            top.addWidget(badge)
+            top.addStretch(1)
+            lay.addLayout(top)
+
+            if dev.volume is not None:
+                vol = QHBoxLayout()
+                vol.setSpacing(8)
+                vol.addSpacing(26)
+                self.slider = QSlider(Qt.Orientation.Horizontal)
+                self.slider.setRange(0, 100)
+                self.slider.setValue(dev.volume)
+                self.slider.valueChanged.connect(self._on_vol)
+                self.vlabel = QLabel(f"{dev.volume}%")
+                self.vlabel.setObjectName("dim")
+                self.vlabel.setFixedWidth(42)
+                vol.addWidget(self.slider, 1)
+                vol.addWidget(self.vlabel)
+                lay.addLayout(vol)
+
+        def _on_vol(self, value: int) -> None:
+            self.vlabel.setText(f"{value}%")
+            self.volume_changed.emit(self.dev.id, value)
+
+    class Watcher(QThread):
+        """CoreAudio has no pactl-style event stream we can cheaply tail, so we
+        poll the device list and fire only when the set of outputs changes."""
+        changed = pyqtSignal()
+
+        def __init__(self) -> None:
+            super().__init__()
+            self._stop = False
+            self._seen: tuple = ()
+
+        def run(self) -> None:
+            while not self._stop:
+                snap = tuple(sorted(
+                    (d, CA.device_uid(d)) for d in CA.device_ids()))
+                if snap != self._seen:
+                    self._seen = snap
+                    self.changed.emit()
+                time.sleep(POLL)
+
+        def stop(self) -> None:
+            self._stop = True
+
+    class MainWindow(QMainWindow):
+        def __init__(self) -> None:
+            super().__init__()
+            self.setWindowTitle("Multi-Out")
+            self.resize(560, 620)
+            self.combine = MultiOut()
+            self.selected: set[str] = set()
+            self.compensate = False
+            self.autoswitch = True
+            self.inv = Inventory()
+            self._applying = False
+            self._load_state()
+            self.auto_engine = AutoSwitch(self.combine)
+
+            root = QWidget()
+            self.setCentralWidget(root)
+            outer = QVBoxLayout(root)
+            outer.setContentsMargins(0, 0, 0, 0)
+            outer.setSpacing(0)
+
+            head = QWidget()
+            head.setObjectName("head")
+            hl = QVBoxLayout(head)
+            hl.setContentsMargins(18, 16, 18, 14)
+            hl.setSpacing(3)
+            t = QLabel("Multi-Out")
+            tf = t.font()
+            tf.setPointSizeF(tf.pointSizeF() + 5)
+            tf.setWeight(QFont.Weight.Bold)
+            t.setFont(tf)
+            hl.addWidget(t)
+            sub = QLabel("Tick every output that should play. Bluetooth, "
+                         "built-in, HDMI and AirPlay can run together.")
+            sub.setObjectName("dim")
+            sub.setWordWrap(True)
+            hl.addWidget(sub)
+            outer.addWidget(head)
+
+            self.scroll = QScrollArea()
+            self.scroll.setWidgetResizable(True)
+            self.scroll.setFrameShape(QFrame.Shape.NoFrame)
+            self.host = QWidget()
+            self.list = QVBoxLayout(self.host)
+            self.list.setContentsMargins(14, 12, 14, 12)
+            self.list.setSpacing(8)
+            self.list.addStretch(1)
+            self.scroll.setWidget(self.host)
+            outer.addWidget(self.scroll, 1)
+
+            foot = QWidget()
+            foot.setObjectName("foot")
+            fl = QVBoxLayout(foot)
+            fl.setContentsMargins(18, 12, 18, 14)
+            fl.setSpacing(10)
+
+            self.auto = QCheckBox(
+                "Switch to Bluetooth automatically when a device connects")
+            self.auto.setChecked(self.autoswitch)
+            self.auto.stateChanged.connect(self._on_auto)
+            fl.addWidget(self.auto)
+
+            self.comp = QCheckBox(
+                "Compensate for drift between devices (clock sync)")
+            self.comp.setChecked(self.compensate)
+            self.comp.stateChanged.connect(self._on_comp)
+            fl.addWidget(self.comp)
+
+            self.status = QLabel("")
+            self.status.setObjectName("dim")
+            self.status.setWordWrap(True)
+            fl.addWidget(self.status)
+
+            btns = QHBoxLayout()
+            btns.setSpacing(8)
+            self.btn_test = QPushButton("Test tone")
+            self.btn_test.setObjectName("ghost")
+            self.btn_test.clicked.connect(self._test_tone)
+            btns.addWidget(self.btn_test)
+            btns.addStretch(1)
+            self.btn_stop = QPushButton("Stop routing")
+            self.btn_stop.setObjectName("ghost")
+            self.btn_stop.clicked.connect(self._stop_routing)
+            btns.addWidget(self.btn_stop)
+            self.btn_apply = QPushButton("Apply")
+            self.btn_apply.setObjectName("primary")
+            self.btn_apply.setDefault(True)
+            self.btn_apply.clicked.connect(self.apply)
+            btns.addWidget(self.btn_apply)
+            fl.addLayout(btns)
+            outer.addWidget(foot)
+
+            self.setStyleSheet(STYLE)
+
+            self.watcher = Watcher()
+            self.watcher.changed.connect(self._debounced_refresh)
+            self.watcher.start()
+
+            self._debounce = QTimer(self)
+            self._debounce.setSingleShot(True)
+            self._debounce.setInterval(400)
+            self._debounce.timeout.connect(self.refresh)
+
+            self.combine.adopt()
+            if self.combine.active:
+                self.status.setText("Adopted the Multi-Out already running.")
+            self.refresh()
+
+        def _load_state(self) -> None:
+            d = load_state()
+            self.selected = set(d.get("selected", []))
+            self.compensate = bool(d.get("compensate", False))
+            self.autoswitch = bool(d.get("autoswitch", True))
+
+        def _save_state(self) -> None:
+            save_state(selected=sorted(self.selected),
+                       compensate=self.compensate,
+                       autoswitch=self.autoswitch)
+
+        def _debounced_refresh(self) -> None:
+            if not self._applying:
+                self._debounce.start()
+
+        def refresh(self) -> None:
+            self.inv = scan()
+            while self.list.count() > 1:
+                item = self.list.takeAt(0)
+                w = item.widget()
+                if w:
+                    w.deleteLater()
+
+            # Hide virtual devices (ours or another tool's aggregate): nesting
+            # one multi-output inside another loops audio back on itself.
+            real = [d for d in self.inv.devices if d.kind != "virtual"]
+            for dev in real:
+                row = DeviceRow(dev, dev.uid in self.selected)
+                row.toggled.connect(self._on_toggle)
+                row.volume_changed.connect(self._set_volume)
+                self.list.insertWidget(self.list.count() - 1, row)
+
+            live = {d.uid for d in real}
+            self.selected &= live
+
+            if (self.autoswitch and not self._applying
+                    and not daemon_running()):
+                self._applying = True
+                try:
+                    msg = self.auto_engine.reconcile(self.inv, self.compensate)
+                finally:
+                    self._applying = False
+                if msg:
+                    self._load_state()
+                    self.status.setText(msg)
+                    QTimer.singleShot(400, self.refresh)
+                    return
+            elif not self.autoswitch:
+                self.auto_engine.prime(self.inv)
+
+            self._update_status()
+
+        def _on_toggle(self) -> None:
+            self.selected = {
+                r.dev.uid
+                for r in self.host.findChildren(DeviceRow)
+                if r.check.isChecked()
+            }
+            self._update_status()
+
+        def _update_status(self) -> None:
+            n = len(self.selected)
+            if n == 0:
+                msg = "No outputs ticked."
+            elif n == 1:
+                msg = "1 output ticked — audio routes to it directly."
+            else:
+                msg = (f"{n} outputs ticked — they will share one "
+                       "Multi-Output device.")
+            if self.combine.active:
+                msg += "  Routing is active."
+            elif self.inv.default_uid:
+                d = self.inv.by_uid(self.inv.default_uid)
+                msg += f"  Currently playing to: {d.name if d else self.inv.default_uid}"
+            if self.autoswitch:
+                msg += ("  Auto-switch on (agent)." if daemon_running()
+                        else "  Auto-switch on (only while this window is open).")
+            self.status.setText(msg)
+            self.btn_stop.setEnabled(self.combine.active)
+
+        def _on_auto(self) -> None:
+            self.autoswitch = self.auto.isChecked()
+            self._save_state()
+            if self.autoswitch:
+                self.auto_engine.prime(self.inv)
+            self._update_status()
+
+        def _on_comp(self) -> None:
+            self.compensate = self.comp.isChecked()
+            self._save_state()
+            if self.combine.active:
+                self.apply()
+
+        def _set_volume(self, dev_id: int, value: int) -> None:
+            CA.set_volume(dev_id, value)
+
+        def apply(self) -> None:
+            targets = sorted(self.selected)
+            if not targets:
+                QMessageBox.information(self, "Nothing selected",
+                                        "Tick at least one output first.")
+                return
+            self._applying = True
+            self.btn_apply.setEnabled(False)
+            try:
+                if len(targets) > 1:
+                    self.status.setText("Building Multi-Output device…")
+                    QApplication.processEvents()
+                dest = activate(self.combine, self.inv, targets,
+                                self.compensate)
+                if dest is None:
+                    QMessageBox.warning(
+                        self, "Could not build Multi-Output device",
+                        "CoreAudio refused to create the aggregate device.\n\n"
+                        "Check that the selected outputs are still connected.")
+                    return
+                self.auto_engine.prime(self.inv)
+                self._save_state()
+            finally:
+                self._applying = False
+                self.btn_apply.setEnabled(True)
+            QTimer.singleShot(300, self.refresh)
+
+        def _stop_routing(self) -> None:
+            if not self.combine.active:
+                return
+            fb = next((d.id for d in self.inv.devices
+                       if d.kind in ("wired", "hdmi", "bluetooth")), None)
+            if fb is not None:
+                CA.set_default_output(fb)
+            self.combine.kill()
+            QTimer.singleShot(300, self.refresh)
+
+        def _test_tone(self) -> None:
+            wav = os.path.join(RUNTIME, "tone.wav")
+            if not os.path.exists(wav):
+                os.makedirs(RUNTIME, exist_ok=True)
+                rate, dur = 48000, 2.0
+                w = wave.open(wav, "w")
+                w.setnchannels(2)
+                w.setsampwidth(2)
+                w.setframerate(rate)
+                frames = bytearray()
+                for i in range(int(rate * dur)):
+                    t = i / rate
+                    freq = 440 if int(t * 2) % 2 == 0 else 660
+                    env = min(1.0, t / 0.05, (dur - t) / 0.05)
+                    s = int(0.25 * env * 32767 * math.sin(2 * math.pi * freq * t))
+                    frames += struct.pack("<hh", s, s)
+                w.writeframes(bytes(frames))
+                w.close()
+            # afplay follows the system default output, which is where our
+            # routing points, so the tone reaches every ticked device.
+            subprocess.Popen(["afplay", wav])
+
+        def closeEvent(self, event) -> None:  # noqa: N802 (Qt naming)
+            self.watcher.stop()
+            self.watcher.wait(int(POLL * 1000) + 500)
+            # Leave routing running: closing the window should not cut the audio
+            # the user just set up.
+            event.accept()
+
+    STYLE = """
+    QMainWindow, QWidget { background: palette(window); }
+    #head { background: palette(base); border-bottom: 1px solid palette(mid); }
+    #foot { background: palette(base); border-top: 1px solid palette(mid); }
+    #row  { background: palette(base); border: 1px solid palette(mid);
+            border-radius: 9px; }
+    #row:hover { border-color: palette(highlight); }
+    #dim  { color: palette(placeholder-text); }
+    #badge { color: palette(placeholder-text); border: 1px solid palette(mid);
+             border-radius: 7px; padding: 1px 7px; font-size: 10px; }
+    QPushButton { padding: 6px 15px; border-radius: 7px; }
+    #primary { background: palette(highlight); color: palette(highlighted-text);
+               border: none; font-weight: 600; }
+    #primary:disabled { background: palette(mid); color: palette(placeholder-text); }
+    #ghost { background: transparent; border: 1px solid palette(mid); }
+    #ghost:hover { border-color: palette(highlight); }
+    #ghost:disabled { color: palette(placeholder-text); border-color: palette(mid); }
+    QSlider::groove:horizontal { height: 4px; background: palette(mid);
+                                 border-radius: 2px; }
+    QSlider::handle:horizontal { width: 13px; height: 13px; margin: -5px 0;
+                                 border-radius: 7px; background: palette(highlight); }
+    QSlider::sub-page:horizontal { background: palette(highlight);
+                                   border-radius: 2px; }
+    """
+
+    app = QApplication(sys.argv)
+    app.setApplicationName("Multi-Out")
+    win = MainWindow()
+    win.show()
+    return app.exec()
+
+
+# ---------------------------------------------------------------- daemon
+
+def daemon() -> int:
+    """Headless auto-switch: no window, no Qt. Polls CoreAudio and hands audio
+    to a Bluetooth device as soon as one shows up, folding it into any running
+    Multi-Output device."""
+    os.makedirs(RUNTIME, exist_ok=True)
+    lock = open(os.path.join(RUNTIME, "daemon.lock"), "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("multiout: auto-switch daemon already running", file=sys.stderr)
+        return 0
+
+    combine = MultiOut()
+    combine.adopt()
+    auto = AutoSwitch(combine)
+    auto.prime(scan())
+    print("multiout: auto-switch daemon watching for Bluetooth outputs",
+          flush=True)
+
+    seen: tuple = ()
+    while True:
+        try:
+            snap = tuple(sorted(
+                (d, CA.device_uid(d)) for d in CA.device_ids()))
+        except Exception:
+            time.sleep(POLL)
+            continue
+        if snap != seen:
+            seen = snap
+            st = load_state()
+            inv = scan()
+            if st.get("autoswitch", True):
+                msg = auto.reconcile(inv, bool(st.get("compensate")))
+                if msg:
+                    print(f"multiout: {msg}", flush=True)
+            else:
+                auto.prime(inv)
+        time.sleep(POLL)
+
+
+# ---------------------------------------------------------------- entry point
+
+def main() -> int:
+    if sys.platform != "darwin":
+        print("multiout: this variant runs on macOS only", file=sys.stderr)
+        return 1
+    if not load_ca():
+        print("multiout: could not load CoreAudio — is this macOS?",
+              file=sys.stderr)
+        return 1
+
+    if "--daemon" in sys.argv[1:]:
+        return daemon()
+    return run_gui()
+
+
+if __name__ == "__main__":
+    sys.exit(main())

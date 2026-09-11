@@ -73,14 +73,27 @@ several outputs at once is done by loopback-capturing the primary and mirroring
 it to the extras, which trail by roughly 30-80 ms. See
 [windows/README.md](windows/README.md).
 
+## macOS
+
+There is a macOS port in [`mac/`](mac/), with the same window and the same
+auto-switch behaviour. It builds a native CoreAudio **Multi-Output device** over
+the ticked outputs and makes it the system default, so — unlike Windows — there
+is no mirroring lag. Install with `./mac/install.sh` (needs Python 3, PyQt6 and
+PyObjC); the auto-switch agent runs under launchd.
+
+It too is **untested** — written on Linux, never yet run against real CoreAudio.
+See [mac/README.md](mac/README.md).
+
 ## Layout
 
 ```
 linux/multiout          the Linux application (GUI + --daemon)
 linux/install.sh        user-local installer
-packaging/              .desktop entry and systemd user unit
+packaging/              .desktop entry, systemd user unit, launchd agent
 windows/multiout.py     the Windows port (GUI + --daemon + --selftest)
 windows/install.ps1     Start Menu shortcut and logon task
+mac/multiout            the macOS port (GUI + --daemon)
+mac/install.sh          user-local installer (launchd agent)
 ```
 
 ## Licence
